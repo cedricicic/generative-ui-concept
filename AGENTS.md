@@ -6,20 +6,15 @@ it.
 
 ## Spending money
 
-A live composition costs real money and time, billed to whoever's `claude` CLI
-is signed in. There is no shared budget. See
-[What a call costs](README.md#what-a-call-costs-and-how-to-not-spend-it-twice)
-for the figures and the caching rules.
+A live composition calls Jev through OpenRouter and is billed to whoever owns
+`OPENROUTER_API_KEY`. It is about $0.0002 a page, so the rule is about keeping
+spend deliberate, not about cost. See
+[What a call costs](README.md#what-a-call-costs-and-how-to-not-spend-it-twice).
 
-- **One live call per change, and `?mode=eval` only.** Not `custom` — a scripted
-  brief is reproducible and a typed one is not.
 - **`/harness` is how you check visuals.** It renders every implemented module
-  from fixture props and costs nothing. Use it after any component or token edit;
-  do not re-compose a page to look at a card.
-- **Never raise `TIMEOUT_MS` to stop it firing.** It firing is the signal that
-  the system prompt or the catalog has grown.
-- **Editing the system prompt or the module catalog invalidates every cached
-  composition.** Screenshot anything worth keeping first.
+  from fixture props and calls nothing.
+- **Bump `COMPOSER_VERSION` or `COPY_VERSION`** when you change a question or a
+  line of copy. They are part of the cache key.
 
 ## Git
 
@@ -33,10 +28,9 @@ Duplicated from the README on purpose: you need these before you have read it.
 
 - **`src/contracts/`** is the source of truth — four Zod schemas. A change here
   changes what the model is sent.
-- **`orchestrator/prompt.md`** is passed to the model *whole* on every call, so
-  every word is billed every time. Version history goes in
-  [`docs/PROMPT-HISTORY.md`](docs/PROMPT-HISTORY.md), never in the prompt. Bump
-  the `# Orchestrator prompt — vN` heading when you edit it; provenance parses it.
+- **`src/orchestration/jev/`** is the composer. Jev only chooses; filters,
+  distances and every visible word are code and copy bank. A new decision is a
+  new question with enumerated options, never free text.
 - **`src/shell/`** is chrome the model cannot compose away. It does not go
   through the layout spec.
 - **`src/renderer/ComposedPage.tsx`** is deliberately dumb: it mounts what the
@@ -53,7 +47,7 @@ way around is not a rule.
 `vitest.config.ts` sets `environment: 'node'` and includes `src/**/*.test.ts`
 only, so the decision logic is covered and **every `.tsx` file is untested by
 design**. Component fidelity is checked by eye in `/harness`, not by assertion.
-`src/orchestration/bridge.ts` is also untested — it spawns a subprocess.
+`src/orchestration/jev/client.ts` is untested: it is the one network call, and the composer tests mock it.
 
 ## Style
 
