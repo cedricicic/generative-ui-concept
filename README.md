@@ -1,6 +1,6 @@
 # Generative UI prototype
 
-A Vivid Seats performer page whose layout is decided by an LLM at request time
+A Vivid Seats performer page whose layout is decided by a model at request time
 rather than designed once for everyone. The same tour data produces a different
 page for a Chicago fan with $80 than for someone who will fly — not different
 copy in a fixed template, but different modules, in a different order, with
@@ -17,28 +17,19 @@ model is allowed to decide, and where a new constraint belongs.
 | | |
 | --- | --- |
 | **Node** | 24 (developed on v24.0.0) |
-| **Claude Code CLI** | `claude` on your `PATH`, signed in. Developed against 2.1.267 |
-| **An API key** | **No.** See below |
-| **Network access** | Only what the CLI needs. The page itself fetches nothing |
+| **An OpenRouter key** | `OPENROUTER_API_KEY` in `.env.local` (gitignored). Any OpenRouter key can call Jev |
+| **Network access** | Only the calls to OpenRouter. The page itself fetches nothing |
 
-Composition runs through the **Claude Code CLI under your own subscription
-auth**, not an Anthropic API key — no org key was available and that was a hard
-no, so `src/orchestration/bridge.ts` spawns `claude -p` as a subprocess. Two
-consequences worth knowing before you plan anything around this: it cannot be
-hosted, so this never runs on Vercel, and it only works on a machine where
-someone is logged into Claude Code.
+Composition runs on **Jev** (`typesafe/jev-1.13`), TypeSafe's decision model,
+through OpenRouter's Decisions API. It replaced the Claude CLI bridge. Jev does
+not write text: it answers typed questions ("which of these", "how useful",
+"yes or no") with probabilities, so every heading and reason the visitor reads is
+chosen from a copy bank in `src/orchestration/jev/copy.ts`, and every filter is
+computed in code. [`docs/COMPOSABILITY.md`](docs/COMPOSABILITY.md) called these
+"selective" knobs; with Jev, all of them are.
 
-Check the CLI is ready before anything else:
-
-```bash
-claude --version        # any 2.x
-```
-
-There is no `.env` and no service to point at. Verified from a clean clone on
-2026-09-16: `npm ci`, typecheck, 208 tests and `next build` all pass, and the dev
-server serves `/`, `/harness` and the fonts with no further setup. The planning
-material that drove the build was kept deliberately outside the repo, and nothing
-here refers to it.
+`src/orchestration/jev/client.ts` pins the model and sets a 5 second timeout.
+`JEV_MODEL` and `JEV_ENDPOINT` override them.
 
 ## Running it
 
@@ -48,13 +39,13 @@ here refers to it.
 2. `npm run dev` — http://localhost:3000
 3. Open **`/`** — the baseline page: no visitor context, no model involved
 4. Press **`Shift+H`** — the developer drawer
-5. Set **Mode** to **Eval** — a composed page, read from cache, with the model's
-   own reasoning under **Why this page**
+5. Set **Mode** to **Eval** — a composed page, read from cache, with what Jev
+   read and chose (written by code from its answers) under **Why this page**
 
 Then, as you like:
 
 ```bash
-npm test                # 208 tests, none of which call the model
+npm test                # 220 tests, none of which call Jev
 npm run typecheck
 npm run build
 npm run format
@@ -83,7 +74,7 @@ never spends it without a press.**
 Opening `?mode=eval` is **free and instant**. It reads the cache and stops. If
 nothing has been composed for that brief yet you get the baseline page plus a
 **Run composition** button in the drawer — pressing that is the only thing in the
-system that can call the model.
+system that can call Jev.
 
 ## Driving the demo
 
@@ -99,56 +90,48 @@ It holds, top to bottom:
   whole thing. Disabled the instant you press it, with an elapsed second count
   below
 - **Briefs you have run** (Custom only) — the last five typed briefs, from the
-  ledger, each marked *cached* (a free replay) or *needs a call*. Editing the
-  system prompt flips every one of them from the first to the second
+  ledger, each marked *cached* (a free replay) or *needs a call*. Bumping the
+  composer or copy version flips every one of them from the first to the second
 - **Estimated cost** — what the last call cost, failures included
-- **Why this page** — the model's own reasoning for this composition
+- **Why this page** — what Jev read about the visitor and what it chose, with
+  confidence, written by code from the answers
 - **What it composed** — modules placed, rows that actually rendered, the top
   pick, and how many dates each filter removed
-- **Provenance** — model, prompt version, timestamp, cost, duration, tokens
+- **Provenance** — model, composer version, timestamp, cost, duration, tokens
 - **Validator** — every drop or repair, or "passed unmodified"
-- **Raw model output** — the unparsed reply
+- **What Jev was asked, and answered** — every stage's state, questions and answers
 
 Drawer state is remembered for the session and starts closed, deliberately not in
 the URL.
 
 There is also `/harness` — dev only, unlinked. Every module at every size from
 fixture props, for judging visual fidelity without a composition in the way. It
-makes no calls, so it is the right place to check a component change after
-editing the system prompt.
+makes no calls, so it is the right place to check a component change.
 
 ## What a call costs, and how to not spend it twice
 
-**$0.12–$0.22 and 40–180 seconds**, on roughly 18,000 input tokens. The bridge
-gives up at 180s (`TIMEOUT_MS`), and a timeout still bills — the tokens are spent
-and there is no composition to show for it. **Do not raise that ceiling**; it
-firing is the signal that the prompt or catalog has grown.
+**About $0.0002 and about one second**, measured on the eval brief on
+2026-09-29: three sequential Jev calls (read the visitor, arrange the page,
+present it), roughly 5,700 input tokens in all at $0.042 per million. Output is
+free. Each call gives up at 5 seconds.
 
-Three things keep spending deliberate:
+It is cheap, but it is still billed to whoever owns the key, so the guards stay:
 
-- **Only a POST to `/api/compose` can call the model.** Rendering a page cannot.
+- **Only a POST to `/api/compose` can call Jev.** Rendering a page cannot.
 - **One call at a time, across the whole server.** Two presses for the same
   composition share one in-flight promise; anything else that arrives mid-call
   gets a 409 and spends nothing.
 - **Every attempt is logged** to `.cache/calls.log`, failures included, with
-  cost, duration, what triggered it, and **the brief it was composed from**. A
-  typed brief lives in the URL and nowhere else, so this is what makes a
-  composition findable again after the tab is gone. The drawer shows the last
-  call — not a total; the total is reconstructable from the log, which is where
-  a question about cumulative spend belongs.
+  cost, duration, what triggered it, and **the brief it was composed from**.
 
-Compositions are cached on disk under `.cache/` (gitignored), keyed on **the
-exact message sent plus the full text of the system prompt**. So:
+Compositions are cached on disk under `.cache/` (gitignored), keyed on the
+context, the market snapshot, the composer and copy versions, and the pinned
+model. So:
 
 - Reloading a composed page is free, forever.
-- Editing `orchestrator/prompt.md`, `src/contracts/module-catalog.ts` or the
-  fixtures **invalidates every cached composition**, because all three change
-  what the model is sent. The next press pays.
+- Bumping `COMPOSER_VERSION` (questions) or `COPY_VERSION` (copy bank), editing
+  the fixtures, or changing `JEV_MODEL` **invalidates every cached composition**.
 - A replay keeps the original call's cost in the panel, so it never looks free.
-
-**If a tab is open on `?mode=eval` while you edit those files, that tab will not
-spend anything** — the page cannot call. But you will lose the cached
-composition, so screenshot anything you want to keep before a prompt edit.
 
 ## How a page gets composed
 
@@ -159,8 +142,9 @@ context + market ─→ OrchestrationProvider ─→ layout spec ─→ validato
 - **`src/contracts/`** — four Zod schemas: context, market, module catalog,
   layout spec. The single source of truth for everything else; changes should be
   additive and deliberate.
-- **`src/orchestration/`** — the provider seam, `bridge.ts` (spawns the CLI),
-  `cache.ts`, `ledger.ts`, and `validate.ts`. The validator **repairs rather than
+- **`src/orchestration/`** — the provider seam, `jev/` (the Jev client, the
+  visitor reading, sections, copy bank and composer), `cache.ts`, `ledger.ts`,
+  and `validate.ts`. The validator **repairs rather than
   discards**: unknown modules are dropped, bad props are stripped back to their
   defaults, and the whole-page fallback is reserved for structural failure. Every
   intervention is recorded and shown in the drawer.
@@ -175,10 +159,12 @@ context + market ─→ OrchestrationProvider ─→ layout spec ─→ validato
 - **`src/demo/`** — the drawer, the modes, and `summarize.ts`.
 - **`src/design/`** — tokens copied verbatim from `vivid-web-athena`, the Figma
   type scale as data, and the MUI theme wiring them together.
-- **`orchestrator/prompt.md`** — the system prompt, read at call time. Its version
-  history is in [`docs/PROMPT-HISTORY.md`](docs/PROMPT-HISTORY.md), deliberately
-  *not* in the prompt file: the bridge passes that file whole, so every word in it
-  is read by the model on every call.
+- **`src/orchestration/jev/compose.ts`** — the three Jev calls. Stage one
+  reads the brief into typed values (city, budget, travel, days, priority).
+  Stage two picks the top group's sort and scores which bands belong below it.
+  Stage three picks headings, card signals, the top pick and its reason, from
+  options that are already true of the rows. The old Claude prompt's history is
+  kept in [`docs/PROMPT-HISTORY.md`](docs/PROMPT-HISTORY.md).
 
 Stack is **Next 16 Pages Router, MUI v6 + Emotion + SCSS modules, Zod, Vitest** —
 matching `vivid-web-athena` on purpose, so ports are copy-and-rewire rather than

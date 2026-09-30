@@ -1,176 +1,32 @@
 import type { Context } from '@/contracts/context'
 import type { Market } from '@/contracts/market'
 import { SpecProvenanceSchema, type ResolvedLayout } from '@/contracts/layout-spec'
-import { MODULE_CATALOG, type ModuleId } from '@/contracts/module-catalog'
 
-import { callModel, readPromptText } from './bridge'
 import { cacheKey, readCached, writeCached } from './cache'
 import { recordCall } from './ledger'
 import { specKeyFor } from './context-key'
+import { JEV_MODEL } from './jev/client'
+import { COMPOSER_VERSION, composeWithJev } from './jev/compose'
 import type { OrchestrationProvider } from './provider'
 import { FALLBACK_LAYOUT, validateLayout } from './validate'
 
 /**
- * Live orchestration — the composition happens at request time.
+ * Live orchestration: the composition happens at request time, by Jev.
  *
  * This is the whole point of the `OrchestrationProvider` seam: the renderer, the
  * validator, the contracts and the modules are all unchanged, and the only
- * difference from the static baseline is where the layout spec comes from.
+ * difference from the static baseline is where the layout spec comes from. It
+ * came from the Claude CLI until the switch to Jev, and nothing downstream had
+ * to change for that.
  *
  * Two deliberate choices:
  *
- * - The model's output goes through the same `validateLayout` as everything else.
- *   Its drop/repair/fallback behaviour was written for exactly this — a
- *   hallucinated module or an out-of-range prop is now a live possibility rather
- *   than a hypothetical.
- * - When the call fails, we fall back to the *precomputed* spec for this context
- *   rather than the static fallback layout, and say so. The page still looks
- *   composed, and provenance never claims `live` for something the model did not
- *   produce.
+ * - The composition goes through the same `validateLayout` as everything else.
+ *   Jev only chooses among options that are already valid, so the validator
+ *   should rarely act, and when it does the note is the bug report.
+ * - When a call fails, the static layout is served and provenance says
+ *   `fallback`, so the page never claims `live` for something Jev did not decide.
  */
-
-/** What the orchestrator is allowed to place, rendered for the prompt. */
-function catalogForPrompt(): string {
-    return (Object.keys(MODULE_CATALOG) as ModuleId[])
-        .filter((id) => MODULE_CATALOG[id].orchestrated && MODULE_CATALOG[id].implemented)
-        .map((id) => {
-            const module = MODULE_CATALOG[id]
-            return [
-                `- \`${id}\` (${module.lever} lever)`,
-                `  purpose: ${module.purpose}`,
-                `  sizes: ${module.sizes.join(' | ')} (default ${module.defaultSize})`,
-                // A fact, not a knob. Where a module renders is intrinsic to it
-                // (docs/COMPOSABILITY.md), but the model should know a rail card
-                // is narrow, desktop-only context before it leans on one.
-                `  region: ${
-                    module.region === 'rail' ? 'right rail (desktop only)' : 'main column'
-                }`,
-                // Without the props, the model invents names that are close but
-                // wrong (`sort_by` for `sort`) and the validator has to strip
-                // them, discarding intent it could have expressed correctly.
-                `  props:`,
-                module.propsHint
-                    .split('\n')
-                    .map((line) => `    ${line}`)
-                    .join('\n'),
-            ].join('\n')
-        })
-        .join('\n')
-}
-
-/**
- * The user half of the request. The system half is `orchestrator/prompt.md`,
- * supplied by the bridge — this adds only the per-request material.
- *
- * The catalog is generated from `MODULE_CATALOG` rather than written out here,
- * so a module can never be offered to the model that the registry cannot render.
- */
-export function buildMessage(context: Context, market: Market): string {
-    // Ordered stable-first, volatile-last, because prompt caching matches on a
-    // prefix: anything that changes between calls invalidates everything after
-    // it. The market snapshot is by far the largest part of this message and the
-    // least likely to change, so it leads; the brief varies every time and goes
-    // last. Putting the brief first — as this did — meant a new brief paid to
-    // re-send 9,000 tokens of inventory that had not moved.
-    const sections = [
-        `Compose the page for this visitor. The inventory comes first, then what you
-may place, then who is landing.`,
-        // Minified rather than pretty-printed: indentation cost ~3,000 tokens a
-        // call and the model reads it identically.
-        `## Market snapshot (the inventory that exists)
-
-\`\`\`json
-${JSON.stringify(market)}
-\`\`\``,
-        `## Modules you may place
-
-${catalogForPrompt()}
-
-Other modules exist in the catalog but are not implemented yet — do not place
-them. \`event_header\` is page chrome and is never yours to place.`,
-        `## Context (who is landing)
-
-\`\`\`json
-${JSON.stringify(context, null, 2)}
-\`\`\``,
-    ]
-
-    // The brief is the operator's own account of the visitor and carries intent
-    // the structured fields cannot. Last, both because it is the most volatile
-    // part and because it should be the freshest thing in mind.
-    if (context.brief) {
-        sections.push(
-            `## Who is landing, described by the person running this
-
-> ${context.brief}
-
-Treat this as the primary account of the visitor. The structured context above
-may be sparse or partly stale; where the two disagree, the description wins. Do
-not invent structured values to fill gaps — compose for what you actually know.`,
-        )
-    }
-
-    sections.push(`Reply with the layout spec object and nothing else — no prose, no code fence.`)
-
-    return sections.join('\n\n')
-}
-
-/**
- * Pulls the layout spec out of the model's reply.
- *
- * Tries the whole string first, then the outermost balanced-brace substring, so
- * a reply wrapped in prose or a fenced code block still parses. Returns null
- * when nothing usable is there — the caller treats that as a failed call rather
- * than guessing.
- */
-export function extractLayoutSpec(text: string): unknown | null {
-    const attempt = (candidate: string): unknown | null => {
-        try {
-            const parsed = JSON.parse(candidate)
-            return parsed !== null && typeof parsed === 'object' ? parsed : null
-        } catch {
-            return null
-        }
-    }
-
-    const direct = attempt(text.trim())
-    if (direct) return direct
-
-    // Walk the string tracking brace depth, ignoring braces inside strings, and
-    // take the first top-level {...}. Regex cannot do this — layout specs nest.
-    const start = text.indexOf('{')
-    if (start === -1) return null
-
-    let depth = 0
-    let inString = false
-    let escaped = false
-
-    for (let i = start; i < text.length; i++) {
-        const char = text[i]
-
-        if (escaped) {
-            escaped = false
-            continue
-        }
-        if (char === '\\') {
-            escaped = true
-            continue
-        }
-        if (char === '"') {
-            inString = !inString
-            continue
-        }
-        if (inString) continue
-
-        if (char === '{') depth++
-        else if (char === '}') {
-            depth--
-            if (depth === 0) return attempt(text.slice(start, i + 1))
-        }
-    }
-
-    return null
-}
 
 export interface LiveProviderOptions {
     /** Names the cache bucket, and shows up in the panel. */
@@ -196,8 +52,8 @@ export async function compositionKey(
 ): Promise<string> {
     return cacheKey({
         mode,
-        message: buildMessage(context, market),
-        promptText: await readPromptText(),
+        message: JSON.stringify({ context, market }),
+        promptText: `${COMPOSER_VERSION}|${JEV_MODEL}`,
     })
 }
 
@@ -248,7 +104,7 @@ function replay(cached: ResolvedLayout, market: Market): ResolvedLayout {
 }
 
 export class LiveProvider implements OrchestrationProvider {
-    readonly name = 'Live (composed at request time by Claude)'
+    readonly name = 'Live (composed at request time by Jev)'
     readonly isLive = true
 
     constructor(private readonly options: LiveProviderOptions = {}) {}
@@ -257,11 +113,10 @@ export class LiveProvider implements OrchestrationProvider {
         const contextId = specKeyFor(context)
         const mode = this.options.mode ?? 'live'
 
-        // Keyed on the exact message plus the prompt text, so editing the
-        // prompt, the catalog, a propsHint or the fixture all invalidate — a
-        // composition attributed to instructions that no longer exist would be
-        // worse than no cache.
-        const message = buildMessage(context, market)
+        // Keyed on the context, the snapshot, the composer and copy versions and
+        // the pinned model, so a change to any of them invalidates. A
+        // composition attributed to questions or copy that no longer exist would
+        // be worse than no cache.
         const key = await compositionKey(context, market, mode)
 
         if (!this.options.fresh) {
@@ -270,55 +125,23 @@ export class LiveProvider implements OrchestrationProvider {
         }
 
         const startedAt = Date.now()
-        const logFailure = (outcome: 'unparseable' | 'failed', error: string) =>
-            recordCall({
-                at: new Date().toISOString(),
-                mode,
-                key,
-                // Load-bearing on the failure path, not bookkeeping. A typed
-                // brief lives in the drawer's React state until a call
-                // succeeds, so when one times out at 180s this line is the only
-                // surviving copy of what was asked for — and a timeout is the
-                // most expensive outcome, since it buys nothing.
-                brief: context.brief ?? null,
-                trigger: this.options.trigger ?? 'unknown',
-                outcome,
-                durationMs: Date.now() - startedAt,
-                // A failed call still spent tokens; we just never learn how many,
-                // because the cost arrives in the envelope we did not get.
-                costUsd: null,
-                inputTokens: null,
-                error,
-            })
 
         try {
-            const call = await callModel(message)
-            const raw = extractLayoutSpec(call.result)
-
-            if (raw === null) {
-                await logFailure('unparseable', 'no layout spec could be parsed out of the reply')
-                return this.fallback(
-                    context,
-                    market,
-                    'the model replied but no layout spec could be parsed out of it',
-                    call.result,
-                )
-            }
-
-            const { spec, notes } = validateLayout(raw, market)
+            const composition = await composeWithJev(context, market)
+            const { spec, notes } = validateLayout(composition.spec, market)
             const resolved: ResolvedLayout = {
                 spec,
                 notes,
                 provenance: SpecProvenanceSchema.parse({
                     generated_at: new Date().toISOString(),
                     source: 'live',
-                    model: call.model,
-                    prompt_version: call.promptVersion,
+                    model: composition.model,
+                    prompt_version: COMPOSER_VERSION,
                     context_id: contextId,
-                    raw_response: call.result,
-                    cost_usd: call.costUsd,
-                    duration_ms: call.durationMs,
-                    input_tokens: call.inputTokens,
+                    raw_response: JSON.stringify(composition.trace, null, 2),
+                    cost_usd: composition.costUsd,
+                    duration_ms: composition.durationMs,
+                    input_tokens: composition.inputTokens,
                 }),
             }
 
@@ -330,15 +153,29 @@ export class LiveProvider implements OrchestrationProvider {
                 brief: context.brief ?? null,
                 trigger: this.options.trigger ?? 'unknown',
                 outcome: 'composed',
-                durationMs: call.durationMs,
-                costUsd: call.costUsd,
-                inputTokens: call.inputTokens,
+                durationMs: composition.durationMs,
+                costUsd: composition.costUsd,
+                inputTokens: composition.inputTokens,
             })
             return resolved
         } catch (error) {
             const reason = error instanceof Error ? error.message : 'unknown error'
-            await logFailure('failed', reason)
-            return this.fallback(context, market, reason, null)
+            await recordCall({
+                at: new Date().toISOString(),
+                mode,
+                key,
+                // A typed brief lives in the drawer's React state until a call
+                // succeeds, so for a failed call this line is the only surviving
+                // copy of what was asked for.
+                brief: context.brief ?? null,
+                trigger: this.options.trigger ?? 'unknown',
+                outcome: 'failed',
+                durationMs: Date.now() - startedAt,
+                costUsd: null,
+                inputTokens: null,
+                error: reason,
+            })
+            return this.fallback(context, reason)
         }
     }
 
@@ -352,12 +189,7 @@ export class LiveProvider implements OrchestrationProvider {
      * page that plainly did not compose. The note and the provenance both say
      * `fallback`.
      */
-    private async fallback(
-        _context: Context,
-        _market: Market,
-        reason: string,
-        rawResponse: string | null,
-    ): Promise<ResolvedLayout> {
+    private fallback(context: Context, reason: string): ResolvedLayout {
         return {
             spec: FALLBACK_LAYOUT,
             provenance: SpecProvenanceSchema.parse({
@@ -365,8 +197,8 @@ export class LiveProvider implements OrchestrationProvider {
                 source: 'fallback',
                 model: null,
                 prompt_version: null,
-                context_id: specKeyFor(_context),
-                raw_response: rawResponse,
+                context_id: specKeyFor(context),
+                raw_response: null,
             }),
             notes: [{ level: 'fallback', reason: `live orchestration failed: ${reason}` }],
         }

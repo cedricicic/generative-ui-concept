@@ -69,9 +69,15 @@ const NOTE_CLASS = {
  * dollars — a spend figure misread by 1000x is worse than no figure at all. The
  * third decimal was never worth anything: a call is 13 to 18 cents and the
  * number this line exists to answer is "how much have I spent today".
+ *
+ * A Jev composition is a few hundredths of a cent, which two decimals round to
+ * "$0.00". That reads as free, and it is not, so sub-cent amounts are shown in
+ * full.
  */
 const formatUsd = (amount: number) =>
-    amount.toLocaleString('en-US', { style: 'currency', currency: 'USD' })
+    amount > 0 && amount < 0.01
+        ? `$${amount.toFixed(6)}`
+        : amount.toLocaleString('en-US', { style: 'currency', currency: 'USD' })
 
 const formatSeconds = (ms: number | null) => (ms === null ? 'unknown' : `${Math.round(ms / 1000)}s`)
 
@@ -468,11 +474,11 @@ export const DemoBar: React.FC<DemoBarProps> = ({
                             <p className={styles.composing} role="status" aria-live="polite">
                                 <span className={styles.spinner} aria-hidden="true" />
                                 <span>
-                                    Calling the model — {elapsed}s
+                                    Asking Jev — {elapsed}s
                                     <span className={styles.composingHint}>
-                                        {elapsed < 120
-                                            ? 'usually 30–120s'
-                                            : 'the bridge gives up at 180s'}
+                                        {elapsed < 5
+                                            ? 'usually about a second'
+                                            : 'each call gives up at 5s'}
                                     </span>
                                 </span>
                             </p>
@@ -611,7 +617,7 @@ export const DemoBar: React.FC<DemoBarProps> = ({
                             </dd>
                             <dt>model</dt>
                             <dd>{provenance.model ?? '—'}</dd>
-                            <dt>prompt</dt>
+                            <dt>composer</dt>
                             <dd>{provenance.prompt_version ?? '—'}</dd>
                             <dt>generated</dt>
                             <dd>{provenance.generated_at}</dd>
@@ -621,7 +627,7 @@ export const DemoBar: React.FC<DemoBarProps> = ({
                                     <dd>
                                         {(provenance.duration_ms / 1000).toFixed(1)}s
                                         {provenance.cost_usd !== null &&
-                                            ` · $${provenance.cost_usd.toFixed(4)}`}
+                                            ` · $${provenance.cost_usd.toFixed(6)}`}
                                         {provenance.input_tokens !== null &&
                                             ` · ${provenance.input_tokens.toLocaleString('en-US')} in`}
                                     </dd>
@@ -646,9 +652,9 @@ export const DemoBar: React.FC<DemoBarProps> = ({
                             </ul>
                         )}
 
-                        <p className={styles.panelHeading}>Raw model output</p>
+                        <p className={styles.panelHeading}>What Jev was asked, and answered</p>
                         <pre className={styles.raw}>
-                            {provenance.raw_response ?? '(static fallback — no model output)'}
+                            {provenance.raw_response ?? '(static fallback, no Jev output)'}
                         </pre>
                     </div>
                 </aside>
